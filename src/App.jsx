@@ -19,7 +19,9 @@ const fetchJson = async (url, options) => {
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     const message = body.error || `Request failed (${response.status})`;
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
   }
   if (response.status === 204) {
     return null;
@@ -40,6 +42,12 @@ const initialForm = {
 };
 
 function App() {
+  const [token, setToken] = useState(() => localStorage.getItem('authToken') || '');
+  const [user, setUser] = useState(null);
+  const [authMode, setAuthMode] = useState('login');
+  const [authForm, setAuthForm] = useState({ username: '', password: '' });
+  const [authError, setAuthError] = useState('');
+  const [authLoading, setAuthLoading] = useState(false);
   const [transactions, setTransactions] = useState([]);
   const [summary, setSummary] = useState({ income: 0, expense: 0, balance: 0 });
   const [report, setReport] = useState({ period: 'month', buckets: [] });
@@ -60,15 +68,50 @@ function App() {
     [summary]
   );
 
+  const authFetch = (url, options = {}) => {
+    const headers = { ...(options.headers || {}) };
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+    return fetchJson(url, { ...options, headers });
+  };
+
+  const handleSignOut = async (silent = false) => {
+    if (token && !silent) {
+      try {
+        await authFetch('/api/auth/logout', { method: 'POST' });
+      } catch (logoutError) {
+        // Ignore logout failures; we clear locally regardless.
+      }
+    }
+    localStorage.removeItem('authToken');
+    setToken('');
+    setUser(null);
+    setTransactions([]);
+    setSummary({ income: 0, expense: 0, balance: 0 });
+    setReport({ period: 'month', buckets: [] });
+    setCategories([]);
+    setForm(initialForm);
+    setEditingId(null);
+    setFormError('');
+    setError('');
+    setAuthForm({ username: '', password: '' });
+    setAuthMode('login');
+    setAuthError('');
+  };
+
   const loadDashboard = async (nextPeriod = period) => {
+    if (!token) {
+      return;
+    }
     setIsLoading(true);
     setError('');
     try {
       const [transactionsData, summaryData, reportData, categoryData] = await Promise.all([
-        fetchJson('/api/transactions?limit=50'),
-        fetchJson('/api/summary'),
-        fetchJson(`/api/report?period=${nextPeriod}&count=6`),
-        fetchJson('/api/categories')
+        authFetch('/api/transactions?limit=50'),
+        authFetch('/api/summary'),
+        authFetch(`/api/report?period=${nextPeriod}&count=6`),
+        authFetch('/api/categories')
       ]);
 
       setTransactions(transactionsData.transactions || []);
@@ -76,6 +119,11 @@ function App() {
       setReport(reportData);
       setCategories(categoryData.categories || []);
     } catch (err) {
+      if (err.status === 401) {
+        await handleSignOut(true);
+        setError('Session expired. Please sign in again.');
+        return;
+      }
       setError(err.message || 'Unable to load data.');
     } finally {
       setIsLoading(false);
@@ -83,11 +131,67 @@ function App() {
   };
 
   useEffect(() => {
+    if (!token) {
+      return;
+    }
+
+    const bootstrap = async () => {
+      try {
+        const data = await authFetch('/api/auth/me');
+        setUser(data.user);
+      } catch (err) {
+        await handleSignOut(true);
+      }
+    };
+
+    bootstrap();
+  }, [token]);
+
+  useEffect(() => {
+    if (!token || !user) {
+      return;
+    }
     loadDashboard(period);
-  }, [period]);
+  }, [period, token, user]);
 
   const updateForm = (field) => (event) => {
     setForm((prev) => ({ ...prev, [field]: event.target.value }));
+  };
+
+  const updateAuthForm = (field) => (event) => {
+    setAuthForm((prev) => ({ ...prev, [field]: event.target.value }));
+  };
+
+  const handleAuthSubmit = async (event) => {
+    event.preventDefault();
+    setAuthError('');
+    setAuthLoading(true);
+
+    try {
+      const payload = {
+        username: authForm.username.trim(),
+        password: authForm.password
+      };
+
+      const data = await fetchJson(`/api/auth/${authMode}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (!data?.token) {
+        throw new Error('Unable to authenticate.');
+      }
+
+      localStorage.setItem('authToken', data.token);
+      setToken(data.token);
+      setUser(data.user);
+      setAuthForm({ username: '', password: '' });
+    } catch (err) {
+      setAuthError(err.message || 'Unable to authenticate.');
+    } finally {
+      setAuthLoading(false);
+    }
   };
 
   const handleSubmit = async (event) => {
@@ -119,13 +223,13 @@ function App() {
       };
 
       if (editingId) {
-        await fetchJson(`/api/transactions/${editingId}`, {
+        await authFetch(`/api/transactions/${editingId}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
       } else {
-        await fetchJson('/api/transactions', {
+        await authFetch('/api/transactions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
@@ -136,6 +240,11 @@ function App() {
       setEditingId(null);
       await loadDashboard(period);
     } catch (err) {
+      if (err.status === 401) {
+        await handleSignOut(true);
+        setFormError('Session expired. Please sign in again.');
+        return;
+      }
       setFormError(err.message || 'Unable to save transaction.');
     }
   };
@@ -167,12 +276,85 @@ function App() {
     }
 
     try {
-      await fetchJson(`/api/transactions/${transaction.id}`, { method: 'DELETE' });
+      await authFetch(`/api/transactions/${transaction.id}`, { method: 'DELETE' });
       await loadDashboard(period);
     } catch (err) {
+      if (err.status === 401) {
+        await handleSignOut(true);
+        setError('Session expired. Please sign in again.');
+        return;
+      }
       setError(err.message || 'Unable to delete transaction.');
     }
   };
+
+  if (!token || !user) {
+    return (
+      <div className="app auth">
+        <header className="hero">
+          <div>
+            <p className="eyebrow">Personal Finance Tracker</p>
+            <h1>Track income, expenses, and the story behind every dollar.</h1>
+            <p className="subtitle">
+              Sign in to start tracking, or create a new account to get started from scratch.
+            </p>
+          </div>
+          <div className="auth-card">
+            <div className="auth-toggle">
+              <button
+                type="button"
+                className={authMode === 'login' ? 'active' : ''}
+                onClick={() => {
+                  setAuthMode('login');
+                  setAuthError('');
+                }}
+              >
+                Sign In
+              </button>
+              <button
+                type="button"
+                className={authMode === 'register' ? 'active' : ''}
+                onClick={() => {
+                  setAuthMode('register');
+                  setAuthError('');
+                }}
+              >
+                Create Account
+              </button>
+            </div>
+            <form className="auth-form" onSubmit={handleAuthSubmit}>
+              <label>
+                Username
+                <input
+                  type="text"
+                  autoComplete="username"
+                  value={authForm.username}
+                  onChange={updateAuthForm('username')}
+                />
+              </label>
+              <label>
+                Password
+                <input
+                  type="password"
+                  autoComplete={authMode === 'register' ? 'new-password' : 'current-password'}
+                  value={authForm.password}
+                  onChange={updateAuthForm('password')}
+                />
+              </label>
+              {authError && <div className="form-error">{authError}</div>}
+              <button className="primary" type="submit" disabled={authLoading}>
+                {authLoading
+                  ? 'Working...'
+                  : authMode === 'login'
+                    ? 'Sign In'
+                    : 'Create Account'}
+              </button>
+            </form>
+          </div>
+        </header>
+      </div>
+    );
+  }
 
   return (
     <div className="app">
@@ -183,6 +365,12 @@ function App() {
           <p className="subtitle">
             Capture daily transactions, assign categories, and watch your balance trend over time.
           </p>
+          <div className="hero-actions">
+            <span className="user-chip">Signed in as {user.username}</span>
+            <button className="ghost" type="button" onClick={() => handleSignOut(false)}>
+              Sign out
+            </button>
+          </div>
         </div>
         <div className="hero-card">
           <div className="hero-card__title">Current Balance</div>

@@ -8,6 +8,7 @@ A lightweight financial management web app built with React + Vite and backed by
 - Balance and totals summary
 - Weekly or monthly spending vs income report
 - Visual chart for trends
+- User accounts with per-user transactions
 
 ## Local setup
 
@@ -30,8 +31,14 @@ The SQLite database is stored at `server/data/expense-tracker.db`.
 
 ## API quick reference
 
+- `POST /api/auth/register`
+- `POST /api/auth/login`
+- `POST /api/auth/logout`
+- `GET /api/auth/me`
 - `GET /api/transactions?limit=50`
 - `POST /api/transactions`
+- `PUT /api/transactions/:id`
+- `DELETE /api/transactions/:id`
 - `GET /api/summary`
 - `GET /api/report?period=month&count=6`
 - `GET /api/categories`

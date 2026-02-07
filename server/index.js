@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import crypto from 'crypto';
 import db from './db.js';
 
 const app = express();
@@ -10,6 +11,7 @@ app.use(express.json({ limit: '1mb' }));
 
 const allowedTypes = new Set(['income', 'expense']);
 const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 14;
 
 function isValidDate(value) {
   return typeof value === 'string' && datePattern.test(value);
@@ -20,9 +22,9 @@ function isValidAmount(value) {
   return Number.isFinite(amount) && amount > 0;
 }
 
-function buildRangeFilter({ start, end }) {
-  const clauses = [];
-  const params = [];
+function buildRangeFilter({ start, end, userId }) {
+  const clauses = ['user_id = ?'];
+  const params = [userId];
 
   if (start && isValidDate(start)) {
     clauses.push('date >= ?');
@@ -38,6 +40,68 @@ function buildRangeFilter({ start, end }) {
     where: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '',
     params
   };
+}
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return { salt, hash };
+}
+
+function verifyPassword(password, salt, hash) {
+  const candidate = crypto.scryptSync(password, salt, 64);
+  const stored = Buffer.from(hash, 'hex');
+  if (stored.length !== candidate.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(stored, candidate);
+}
+
+function createSession(userId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+
+  db.prepare(
+    'INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)'
+  ).run(token, userId, expiresAt);
+
+  return { token, expiresAt };
+}
+
+function getToken(req) {
+  const authHeader = req.headers.authorization || '';
+  if (authHeader.startsWith('Bearer ')) {
+    return authHeader.slice(7).trim();
+  }
+  return null;
+}
+
+function requireAuth(req, res, next) {
+  const token = getToken(req);
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized.' });
+  }
+
+  const session = db
+    .prepare(
+      `SELECT sessions.token, sessions.user_id, sessions.expires_at, users.username
+       FROM sessions
+       JOIN users ON users.id = sessions.user_id
+       WHERE sessions.token = ?`
+    )
+    .get(token);
+
+  if (!session) {
+    return res.status(401).json({ error: 'Unauthorized.' });
+  }
+
+  if (new Date(session.expires_at) <= new Date()) {
+    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    return res.status(401).json({ error: 'Session expired.' });
+  }
+
+  req.user = { id: session.user_id, username: session.username };
+  req.sessionToken = token;
+  return next();
 }
 
 function parseISODate(value) {
@@ -71,10 +135,78 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-app.get('/api/transactions', (req, res) => {
+app.post('/api/auth/register', (req, res) => {
+  const { username, password } = req.body || {};
+  const cleanUsername = typeof username === 'string' ? username.trim() : '';
+
+  if (cleanUsername.length < 3 || cleanUsername.length > 30) {
+    return res.status(400).json({ error: 'Username must be 3-30 characters.' });
+  }
+
+  if (typeof password !== 'string' || password.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+  }
+
+  const existing = db
+    .prepare('SELECT id FROM users WHERE username = ?')
+    .get(cleanUsername);
+
+  if (existing) {
+    return res.status(409).json({ error: 'Username is already taken.' });
+  }
+
+  const { salt, hash } = hashPassword(password);
+  const info = db
+    .prepare(
+      'INSERT INTO users (username, password_hash, password_salt) VALUES (?, ?, ?)'
+    )
+    .run(cleanUsername, hash, salt);
+
+  const session = createSession(info.lastInsertRowid);
+
+  return res.status(201).json({
+    token: session.token,
+    user: { id: info.lastInsertRowid, username: cleanUsername }
+  });
+});
+
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body || {};
+  const cleanUsername = typeof username === 'string' ? username.trim() : '';
+
+  if (!cleanUsername || typeof password !== 'string') {
+    return res.status(400).json({ error: 'Username and password are required.' });
+  }
+
+  const user = db
+    .prepare('SELECT id, username, password_hash, password_salt FROM users WHERE username = ?')
+    .get(cleanUsername);
+
+  if (!user || !verifyPassword(password, user.password_salt, user.password_hash)) {
+    return res.status(401).json({ error: 'Invalid username or password.' });
+  }
+
+  const session = createSession(user.id);
+
+  return res.json({
+    token: session.token,
+    user: { id: user.id, username: user.username }
+  });
+});
+
+app.post('/api/auth/logout', requireAuth, (req, res) => {
+  db.prepare('DELETE FROM sessions WHERE token = ?').run(req.sessionToken);
+  return res.status(204).send();
+});
+
+app.get('/api/auth/me', requireAuth, (req, res) => {
+  return res.json({ user: req.user });
+});
+
+app.get('/api/transactions', requireAuth, (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 50, 200);
   const { start, end } = req.query;
-  const { where, params } = buildRangeFilter({ start, end });
+  const { where, params } = buildRangeFilter({ start, end, userId: req.user.id });
 
   const rows = db
     .prepare(
@@ -89,15 +221,20 @@ app.get('/api/transactions', (req, res) => {
   res.json({ transactions: rows });
 });
 
-app.get('/api/categories', (req, res) => {
+app.get('/api/categories', requireAuth, (req, res) => {
   const rows = db
-    .prepare(`SELECT DISTINCT category FROM transactions ORDER BY category COLLATE NOCASE`)
-    .all();
+    .prepare(
+      `SELECT DISTINCT category
+       FROM transactions
+       WHERE user_id = ?
+       ORDER BY category COLLATE NOCASE`
+    )
+    .all(req.user.id);
 
   res.json({ categories: rows.map((row) => row.category) });
 });
 
-app.post('/api/transactions', (req, res) => {
+app.post('/api/transactions', requireAuth, (req, res) => {
   const { type, amount, category, date, note } = req.body || {};
 
   if (!allowedTypes.has(type)) {
@@ -121,23 +258,23 @@ app.post('/api/transactions', (req, res) => {
 
   const info = db
     .prepare(
-      `INSERT INTO transactions (type, amount, category, date, note)
-       VALUES (?, ?, ?, ?, ?)`
+      `INSERT INTO transactions (user_id, type, amount, category, date, note)
+       VALUES (?, ?, ?, ?, ?, ?)`
     )
-    .run(type, Number(amount), cleanCategory, date, cleanNote || null);
+    .run(req.user.id, type, Number(amount), cleanCategory, date, cleanNote || null);
 
   const created = db
     .prepare(
       `SELECT id, type, amount, category, date, note
        FROM transactions
-       WHERE id = ?`
+       WHERE id = ? AND user_id = ?`
     )
-    .get(info.lastInsertRowid);
+    .get(info.lastInsertRowid, req.user.id);
 
   return res.status(201).json({ transaction: created });
 });
 
-app.put('/api/transactions/:id', (req, res) => {
+app.put('/api/transactions/:id', requireAuth, (req, res) => {
   const id = Number(req.params.id);
   const { type, amount, category, date, note } = req.body || {};
 
@@ -168,9 +305,9 @@ app.put('/api/transactions/:id', (req, res) => {
     .prepare(
       `UPDATE transactions
        SET type = ?, amount = ?, category = ?, date = ?, note = ?
-       WHERE id = ?`
+       WHERE id = ? AND user_id = ?`
     )
-    .run(type, Number(amount), cleanCategory, date, cleanNote || null, id);
+    .run(type, Number(amount), cleanCategory, date, cleanNote || null, id, req.user.id);
 
   if (result.changes === 0) {
     return res.status(404).json({ error: 'Transaction not found.' });
@@ -180,21 +317,23 @@ app.put('/api/transactions/:id', (req, res) => {
     .prepare(
       `SELECT id, type, amount, category, date, note
        FROM transactions
-       WHERE id = ?`
+       WHERE id = ? AND user_id = ?`
     )
-    .get(id);
+    .get(id, req.user.id);
 
   return res.json({ transaction: updated });
 });
 
-app.delete('/api/transactions/:id', (req, res) => {
+app.delete('/api/transactions/:id', requireAuth, (req, res) => {
   const id = Number(req.params.id);
 
   if (!Number.isInteger(id) || id <= 0) {
     return res.status(400).json({ error: 'Invalid transaction id.' });
   }
 
-  const result = db.prepare('DELETE FROM transactions WHERE id = ?').run(id);
+  const result = db
+    .prepare('DELETE FROM transactions WHERE id = ? AND user_id = ?')
+    .run(id, req.user.id);
 
   if (result.changes === 0) {
     return res.status(404).json({ error: 'Transaction not found.' });
@@ -203,9 +342,9 @@ app.delete('/api/transactions/:id', (req, res) => {
   return res.status(204).send();
 });
 
-app.get('/api/summary', (req, res) => {
+app.get('/api/summary', requireAuth, (req, res) => {
   const { start, end } = req.query;
-  const { where, params } = buildRangeFilter({ start, end });
+  const { where, params } = buildRangeFilter({ start, end, userId: req.user.id });
 
   const row = db
     .prepare(
@@ -227,7 +366,7 @@ app.get('/api/summary', (req, res) => {
   });
 });
 
-app.get('/api/report', (req, res) => {
+app.get('/api/report', requireAuth, (req, res) => {
   const period = req.query.period === 'week' ? 'week' : 'month';
   const count = Math.min(Math.max(Number(req.query.count) || 6, 2), 24);
 
@@ -276,9 +415,9 @@ app.get('/api/report', (req, res) => {
     .prepare(
       `SELECT date, type, amount
        FROM transactions
-       WHERE date >= ? AND date <= ?`
+       WHERE user_id = ? AND date >= ? AND date <= ?`
     )
-    .all(formatDate(rangeStart), formatDate(rangeEnd));
+    .all(req.user.id, formatDate(rangeStart), formatDate(rangeEnd));
 
   const bucketMap = new Map(buckets.map((bucket) => [bucket.key, bucket]));
 
