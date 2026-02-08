@@ -1,6 +1,6 @@
 # Expense Tracker
 
-A lightweight financial management web app built with React + Vite and backed by SQLite.
+A lightweight financial management web app built with React + Vite and backed by SQLite (via libSQL/Turso for deployment).
 
 ## Features
 - Record income and expenses
@@ -12,13 +12,22 @@ A lightweight financial management web app built with React + Vite and backed by
 
 ## Local setup
 
-1. Install dependencies:
+1. Set environment variables (local dev):
+
+Create a `.env` file in the project root with:
+
+```
+TURSO_DATABASE_URL=your_turso_url
+TURSO_AUTH_TOKEN=your_turso_auth_token
+```
+
+2. Install dependencies:
 
 ```bash
 npm install
 ```
 
-2. Run the client + API together:
+3. Run the client + API together:
 
 ```bash
 npm run dev
@@ -27,7 +36,15 @@ npm run dev
 - Vite dev server: http://localhost:5173
 - API server: http://localhost:5174
 
-The SQLite database is stored at `server/data/expense-tracker.db`.
+The API requires a libSQL/Turso database URL and token (SQLite files are not persisted on Vercel).
+
+## Deploy to Vercel
+
+1. Push this repo to GitHub and import it in Vercel.
+2. Add environment variables in Vercel:
+   - `TURSO_DATABASE_URL`
+   - `TURSO_AUTH_TOKEN`
+3. Deploy.
 
 ## API quick reference
 

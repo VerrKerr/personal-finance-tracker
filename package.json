@@ -12,8 +12,9 @@
     "start": "node server/index.js"
   },
   "dependencies": {
-    "better-sqlite3": "^9.4.1",
+    "@libsql/client": "^0.13.0",
     "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
